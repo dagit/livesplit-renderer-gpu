@@ -28,9 +28,17 @@
 //! [glow]: https://docs.rs/glow
 //! [lyon]: https://docs.rs/lyon
 
+mod common;
+
 mod allocator;
 mod render;
 mod shaders;
 mod types;
 
+mod wgpu_allocator;
+mod wgpu_render;
+mod wgpu_shaders;
+mod wgpu_types;
+
 pub use render::GlowRenderer;
+pub use wgpu_render::WgpuRenderer;

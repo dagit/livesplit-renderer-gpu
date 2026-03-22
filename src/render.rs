@@ -12,15 +12,11 @@ use livesplit_core::{
 use std::sync::Arc;
 
 use crate::{
-    allocator::{self, GlAllocator},
+    allocator::GlAllocator,
+    common::{tessellate_stroke, vertex_bounds, BLUR_FACTOR, SHADOW_OFFSET},
     shaders,
     types::{GlFont, GlImage, GlLabel, GlPath, Vertex},
 };
-
-/// Shadow offset in component coordinate space.
-///
-/// Matches livesplit-core's internal constant (which is not publicly exported).
-const SHADOW_OFFSET: f32 = 0.05;
 
 /// Number of MSAA samples for antialiasing.
 const MSAA_SAMPLES: i32 = 4;
@@ -30,11 +26,6 @@ const MSAA_SAMPLES: i32 = 4;
 ///
 #[expect(clippy::cast_possible_wrap)]
 const RGBA8_INTERNAL_FORMAT: i32 = glow::RGBA8 as i32;
-
-/// Factor applied to the blur setting to compute the gaussian sigma.
-///
-/// Matches livesplit-core's `BLUR_FACTOR`.
-const BLUR_FACTOR: f32 = 0.05;
 
 /// Convert a `u32` to `i32` for GL API calls.
 ///
@@ -334,6 +325,10 @@ impl GlowRenderer {
         image_cache: &ImageCache,
         [width, height]: [u32; 2],
     ) -> Option<[f32; 2]> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+
         // Precision loss is acceptable: viewport dimensions are small
         // relative to f32 mantissa range.
         #[expect(clippy::cast_precision_loss)]
@@ -348,6 +343,26 @@ impl GlowRenderer {
         let new_resolution =
             self.scene_manager
                 .update_scene(&mut self.allocator, resolution, state, image_cache);
+
+        // Pre-compute blur before starting render passes (needs &mut self).
+        // Extract the blur parameters while scene is borrowed, then drop
+        // the borrow before calling update_blur_cache.
+        let blur_params = {
+            let scene = self.scene_manager.scene();
+            if scene.bottom_layer_changed() || self.bottom_layer_dirty {
+                match scene.background() {
+                    Some(Background::Image(bg_image, _)) if bg_image.blur > 0.0 => {
+                        Some((Arc::clone(&bg_image.image.data), bg_image.blur))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((image_data, blur_value)) = blur_params {
+            unsafe { self.update_blur_cache(&image_data, blur_value) };
+        }
 
         let scene = self.scene_manager.scene();
         let bottom_layer_changed = scene.bottom_layer_changed();
@@ -454,7 +469,7 @@ impl GlowRenderer {
             }
             Entity::StrokePath(path, stroke_width, color, transform) => {
                 if let Some(path) = path.as_ref() {
-                    if let Some(stroked) = allocator::tessellate_stroke(path, *stroke_width) {
+                    if let Some(stroked) = tessellate_stroke(path, *stroke_width) {
                         let shader = FillShader::SolidColor(*color);
                         unsafe { self.draw_path(&stroked, &shader, transform, resolution) };
                     }
@@ -773,9 +788,12 @@ impl GlowRenderer {
     ) {
         let gl = &self.gl;
 
-        // Determine which texture to use: blurred or original.
+        // Determine which texture to use: blurred (from pre-computed cache) or original.
         let texture = if bg_image.blur > 0.0 {
-            self.get_or_create_blurred_texture(&bg_image.image, bg_image.blur)
+            self.blur_cache.as_ref().map_or_else(
+                || unsafe { self.ensure_texture(&bg_image.image) },
+                |c| c.texture,
+            )
         } else {
             unsafe { self.ensure_texture(&bg_image.image) }
         };
@@ -812,34 +830,36 @@ impl GlowRenderer {
         unsafe { gl.bind_texture(glow::TEXTURE_2D, None) };
     }
 
-    /// Get or create a blurred version of the given image, cached for reuse.
+    /// Pre-compute the blurred background texture if needed.
+    ///
+    /// Called before the render passes while we still have `&mut self`,
+    /// so the result can be stored in `self.blur_cache`.
+    ///
+    /// # Safety
+    ///
+    /// The GL context must be current and valid.
     ///
     /// # Panics
     ///
     /// Panics if the GL context has been lost.
-    fn get_or_create_blurred_texture(
-        &self,
-        image: &Handle<GlImage>,
+    unsafe fn update_blur_cache(
+        &mut self,
+        image_data: &Arc<crate::types::GlImageData>,
         blur_value: f32,
-    ) -> glow::Texture {
-        let source_ptr = Arc::as_ptr(&image.data) as usize;
+    ) {
+        let source_ptr = Arc::as_ptr(image_data) as usize;
 
-        // Check if the cache already has a matching blurred texture.
+        // Check if the cache is already valid.
         if let Some(cache) = &self.blur_cache {
             if cache.source_ptr == source_ptr
                 && (cache.blur_value - blur_value).abs() < f32::EPSILON
             {
-                return cache.texture;
+                return;
             }
         }
 
         // Cache miss — blur on CPU and upload.
-        // Note: We can't update self.blur_cache here because we only have &self.
-        // The blurred texture is created but not cached. The caller (render)
-        // could be restructured to pass &mut self for caching, but for now
-        // we just create it each time the bottom layer is re-rendered (which
-        // is infrequent due to the two-layer caching system).
-        let data = &image.data;
+        let data = image_data;
         #[expect(clippy::cast_precision_loss)]
         let sigma = BLUR_FACTOR * blur_value * (data.width.max(data.height) as f32);
 
@@ -851,6 +871,12 @@ impl GlowRenderer {
 
         let blurred_rgba = blurred.to_rgba8();
         let gl = &self.gl;
+
+        // Delete old cached texture before creating a new one.
+        if let Some(old_cache) = &self.blur_cache {
+            unsafe { gl.delete_texture(old_cache.texture) };
+        }
+
         let texture = unsafe { gl.create_texture() }.expect("GL context lost: create_texture");
         unsafe {
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -869,7 +895,11 @@ impl GlowRenderer {
             gl.bind_texture(glow::TEXTURE_2D, None);
         }
 
-        texture
+        self.blur_cache = Some(BlurCache {
+            source_ptr,
+            blur_value,
+            texture,
+        });
     }
 
     /// Blit the cached bottom-layer FBO texture to the current framebuffer as
@@ -952,6 +982,11 @@ impl GlowRenderer {
                 Some(self.fbo_texture),
                 0,
             );
+            debug_assert_eq!(
+                gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                glow::FRAMEBUFFER_COMPLETE,
+                "resolve FBO incomplete",
+            );
 
             // Set up the MSAA renderbuffer.
             gl.bind_renderbuffer(glow::RENDERBUFFER, Some(self.msaa_rbo));
@@ -969,6 +1004,11 @@ impl GlowRenderer {
                 glow::COLOR_ATTACHMENT0,
                 glow::RENDERBUFFER,
                 Some(self.msaa_rbo),
+            );
+            debug_assert_eq!(
+                gl.check_framebuffer_status(glow::FRAMEBUFFER),
+                glow::FRAMEBUFFER_COMPLETE,
+                "MSAA FBO incomplete",
             );
 
             gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -1001,104 +1041,5 @@ impl GlowRenderer {
         if let Some(cache) = &self.blur_cache {
             unsafe { gl.delete_texture(cache.texture) };
         }
-    }
-}
-
-/// Compute the min/max of a single axis across all path vertices.
-///
-/// Used to determine the interpolation range for gradient shaders.
-/// `axis` is the index into `Vertex::position` (0 = X, 1 = Y).
-///
-/// Returns `[0.0, 0.0]` for an empty vertex slice.
-fn vertex_bounds(vertices: &[Vertex], axis: usize) -> [f32; 2] {
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for v in vertices {
-        let val = v.position[axis];
-        min = min.min(val);
-        max = max.max(val);
-    }
-    if max < min {
-        [0.0, 0.0]
-    } else {
-        [min, max]
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    /// Helper to compare `[f32; 2]` with tolerance.
-    fn assert_bounds_eq(actual: [f32; 2], expected: [f32; 2]) {
-        assert!(
-            (actual[0] - expected[0]).abs() < f32::EPSILON
-                && (actual[1] - expected[1]).abs() < f32::EPSILON,
-            "expected {expected:?}, got {actual:?}",
-        );
-    }
-
-    #[test]
-    fn vertex_bounds_y_known_values() {
-        let vertices = [
-            Vertex {
-                position: [0.0, 1.0],
-            },
-            Vertex {
-                position: [1.0, 3.0],
-            },
-            Vertex {
-                position: [2.0, 2.0],
-            },
-        ];
-        assert_bounds_eq(vertex_bounds(&vertices, 1), [1.0, 3.0]);
-    }
-
-    #[test]
-    fn vertex_bounds_x_known_values() {
-        let vertices = [
-            Vertex {
-                position: [5.0, 0.0],
-            },
-            Vertex {
-                position: [2.0, 0.0],
-            },
-            Vertex {
-                position: [8.0, 0.0],
-            },
-        ];
-        assert_bounds_eq(vertex_bounds(&vertices, 0), [2.0, 8.0]);
-    }
-
-    #[test]
-    fn vertex_bounds_empty_returns_zeros() {
-        let empty: &[Vertex] = &[];
-        assert_bounds_eq(vertex_bounds(empty, 0), [0.0, 0.0]);
-        assert_bounds_eq(vertex_bounds(empty, 1), [0.0, 0.0]);
-    }
-
-    #[test]
-    fn vertex_bounds_single_vertex() {
-        let vertices = [Vertex {
-            position: [3.0, 7.0],
-        }];
-        let [min, max] = vertex_bounds(&vertices, 0);
-        assert!((min - max).abs() < f32::EPSILON);
-        assert!((min - 3.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn vertex_bounds_negative_coordinates() {
-        let vertices = [
-            Vertex {
-                position: [-5.0, -10.0],
-            },
-            Vertex {
-                position: [5.0, 10.0],
-            },
-        ];
-        assert_bounds_eq(vertex_bounds(&vertices, 0), [-5.0, 5.0]);
-        assert_bounds_eq(vertex_bounds(&vertices, 1), [-10.0, 10.0]);
     }
 }

@@ -8,17 +8,17 @@ use livesplit_core::{
 use std::sync::Arc;
 
 use crate::common::CommonPathBuilder;
-use crate::types::{GlFont, GlImage, GlImageData, GlLabel, GlPath};
+use crate::wgpu_types::{WgpuFont, WgpuImage, WgpuImageData, WgpuLabel, WgpuPath};
 
 /// The resource allocator that wires together path tessellation (via lyon)
 /// and text shaping (via livesplit-core's default text engine).
-pub struct GlAllocator {
+pub struct WgpuAllocator {
     /// Text engine instance used for font loading, glyph shaping, and label
     /// management.
-    pub(crate) text_engine: TextEngine<Option<GlPath>>,
+    pub(crate) text_engine: TextEngine<Option<WgpuPath>>,
 }
 
-impl GlAllocator {
+impl WgpuAllocator {
     /// Create a new allocator with a fresh text engine.
     pub fn new() -> Self {
         Self {
@@ -27,18 +27,18 @@ impl GlAllocator {
     }
 }
 
-impl Default for GlAllocator {
+impl Default for WgpuAllocator {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ResourceAllocator for GlAllocator {
+impl ResourceAllocator for WgpuAllocator {
     type PathBuilder = CommonPathBuilder;
-    type Path = Option<GlPath>;
-    type Image = GlImage;
-    type Font = GlFont;
-    type Label = GlLabel;
+    type Path = Option<WgpuPath>;
+    type Image = WgpuImage;
+    type Font = WgpuFont;
+    type Label = WgpuLabel;
 
     fn path_builder(&mut self) -> Self::PathBuilder {
         CommonPathBuilder::new()
@@ -47,8 +47,8 @@ impl ResourceAllocator for GlAllocator {
     fn create_image(&mut self, data: &[u8]) -> Option<Self::Image> {
         let img = image::load_from_memory(data).ok()?.to_rgba8();
         let (width, height) = img.dimensions();
-        Some(GlImage {
-            data: Arc::new(GlImageData {
+        Some(WgpuImage {
+            data: Arc::new(WgpuImageData {
                 pixels: img.into_raw(),
                 width,
                 height,
@@ -57,6 +57,7 @@ impl ResourceAllocator for GlAllocator {
                 #[expect(clippy::cast_precision_loss)]
                 aspect_ratio: width as f32 / height as f32,
                 texture: std::sync::RwLock::new(None),
+                bind_group: std::sync::RwLock::new(None),
             }),
         })
     }
@@ -97,7 +98,7 @@ mod tests {
 
     #[test]
     fn create_image_with_invalid_data_returns_none() {
-        let mut alloc = GlAllocator::new();
+        let mut alloc = WgpuAllocator::new();
         assert!(alloc.create_image(b"not an image").is_none());
     }
 
@@ -114,7 +115,7 @@ mod tests {
                 .unwrap();
         }
 
-        let mut alloc = GlAllocator::new();
+        let mut alloc = WgpuAllocator::new();
         let image = alloc.create_image(buf.get_ref());
         assert!(image.is_some(), "valid PNG should produce an image");
 
@@ -128,6 +129,6 @@ mod tests {
 
     #[test]
     fn allocator_default_matches_new() {
-        let _alloc: GlAllocator = GlAllocator::default();
+        let _alloc: WgpuAllocator = WgpuAllocator::default();
     }
 }

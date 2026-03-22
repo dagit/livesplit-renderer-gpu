@@ -12,6 +12,7 @@ categories = ["rendering", "graphics"]
 [dependencies]
 livesplit-core = { git = "https://github.com/LiveSplit/livesplit-core", features = ["default-text-engine", "font-loading"] }
 glow = "0.16"
+wgpu = "25"
 lyon = "1"
 bytemuck = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
