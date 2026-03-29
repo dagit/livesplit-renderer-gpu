@@ -135,11 +135,12 @@ void main() {
 ///
 /// # Uniforms
 ///
-/// | Name           | Type        | Description                          |
-/// |----------------|-------------|--------------------------------------|
-/// | `u_texture`    | `sampler2D` | Bound texture unit                   |
-/// | `u_brightness` | `float`     | Brightness multiplier (1.0 = normal) |
-/// | `u_opacity`    | `float`     | Opacity multiplier (1.0 = opaque)    |
+/// | Name                     | Type        | Description                                        |
+/// |--------------------------|-------------|----------------------------------------------------|
+/// | `u_texture`              | `sampler2D` | Bound texture unit                                 |
+/// | `u_brightness`           | `float`     | Brightness multiplier (1.0 = normal)               |
+/// | `u_opacity`              | `float`     | Opacity multiplier (1.0 = opaque)                  |
+/// | `u_already_premultiplied`| `int`       | If non-zero, skip alpha premultiplication (FBO blit)|
 pub const IMAGE_FRAGMENT_SRC: &str = r"#version 140
 
 in vec2 v_uv;
@@ -147,6 +148,7 @@ in vec2 v_uv;
 uniform sampler2D u_texture;
 uniform float u_brightness;
 uniform float u_opacity;
+uniform int u_already_premultiplied;
 
 out vec4 frag_color;
 
@@ -154,8 +156,10 @@ void main() {
     frag_color = texture(u_texture, v_uv);
     frag_color.rgb *= u_brightness;
     frag_color.a *= u_opacity;
-    // Premultiply alpha
-    frag_color.rgb *= frag_color.a;
+    // Premultiply alpha (skip if content is already premultiplied, e.g. FBO blit)
+    if (u_already_premultiplied == 0) {
+        frag_color.rgb *= frag_color.a;
+    }
 }
 ";
 

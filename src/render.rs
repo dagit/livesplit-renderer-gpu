@@ -71,6 +71,9 @@ struct ImageUniforms {
     brightness: glow::UniformLocation,
     /// `u_opacity` — opacity multiplier (1.0 = fully opaque).
     opacity: glow::UniformLocation,
+    /// `u_already_premultiplied` — if non-zero, skip alpha premultiplication
+    /// (used when blitting FBO content that is already premultiplied).
+    already_premultiplied: glow::UniformLocation,
 }
 
 /// Cached blurred background texture.
@@ -244,6 +247,9 @@ impl GlowRenderer {
                 opacity: gl
                     .get_uniform_location(image_program, "u_opacity")
                     .expect("u_opacity missing from image shader"),
+                already_premultiplied: gl
+                    .get_uniform_location(image_program, "u_already_premultiplied")
+                    .expect("u_already_premultiplied missing from image shader"),
             }
         };
 
@@ -319,6 +325,7 @@ impl GlowRenderer {
     ///
     /// Requires a current GL context matching the one passed to
     /// [`new`](Self::new).
+    #[expect(clippy::too_many_lines)]
     pub unsafe fn render(
         &mut self,
         state: &LayoutState,
@@ -369,6 +376,11 @@ impl GlowRenderer {
         let bottom_layer_changed = scene.bottom_layer_changed();
 
         let gl = &self.gl;
+
+        // Save and disable scissor test — the caller (e.g. egui paint callback)
+        // may have scissor enabled, which would corrupt our FBO clears and blits.
+        let scissor_was_enabled = unsafe { gl.is_enabled(glow::SCISSOR_TEST) };
+        unsafe { gl.disable(glow::SCISSOR_TEST) };
 
         unsafe {
             // Set up blending for premultiplied alpha.
@@ -453,6 +465,11 @@ impl GlowRenderer {
             );
 
             gl.disable(glow::BLEND);
+        }
+
+        // Restore scissor test to whatever the caller had.
+        if scissor_was_enabled {
+            unsafe { gl.enable(glow::SCISSOR_TEST) };
         }
 
         new_resolution
@@ -669,6 +686,7 @@ impl GlowRenderer {
             gl.uniform_1_i32(Some(&self.image_uniforms.flip_uv_y), 0);
             gl.uniform_1_f32(Some(&self.image_uniforms.brightness), 1.0);
             gl.uniform_1_f32(Some(&self.image_uniforms.opacity), 1.0);
+            gl.uniform_1_i32(Some(&self.image_uniforms.already_premultiplied), 0);
 
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -817,6 +835,7 @@ impl GlowRenderer {
             gl.uniform_1_i32(Some(&self.image_uniforms.flip_uv_y), 0);
             gl.uniform_1_f32(Some(&self.image_uniforms.brightness), bg_image.brightness);
             gl.uniform_1_f32(Some(&self.image_uniforms.opacity), bg_image.opacity);
+            gl.uniform_1_i32(Some(&self.image_uniforms.already_premultiplied), 0);
 
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -926,6 +945,7 @@ impl GlowRenderer {
             gl.uniform_1_i32(Some(&self.image_uniforms.flip_uv_y), 1);
             gl.uniform_1_f32(Some(&self.image_uniforms.brightness), 1.0);
             gl.uniform_1_f32(Some(&self.image_uniforms.opacity), 1.0);
+            gl.uniform_1_i32(Some(&self.image_uniforms.already_premultiplied), 1);
 
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(glow::TEXTURE_2D, Some(self.fbo_texture));
